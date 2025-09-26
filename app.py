@@ -4,9 +4,24 @@ from werkzeug.utils import secure_filename
 import os, json, re, random
 import spacy
 from PyPDF2 import PdfReader
-from spire.pdf import *
 import faker
 import traceback
+
+# Option 1: Avec Spire.PDF corrigé
+try:
+    from spire.pdf import PdfDocument, PdfTextReplacer
+    SPIRE_AVAILABLE = True
+except ImportError:
+    SPIRE_AVAILABLE = False
+    print("Spire.PDF non disponible, utilisation de PyMuPDF")
+
+# Option 2: Avec PyMuPDF (plus stable)
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+    print("PyMuPDF non disponible")
 
 # --- Configurations ---
 app = Flask(__name__)
@@ -27,110 +42,186 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def extract_text_from_pdf(path):
-    reader = PdfReader(path)
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    try:
+        reader = PdfReader(path)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as e:
+        print(f"Erreur extraction texte: {e}")
+        return ""
 
 def generate_fake_value(word, fake):
     email_pattern = r"\b[A-Za-z0-9.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
     iban_pattern = r"[A-Z]{2}\d{2}\s?(?:\d{4}\s?){4,7}\d{1,4}"
     bic_pattern = r"[A-Z]{4}\s?\w{2}\s?\w{2}"
 
-    if re.match(iban_pattern, word):
-        return word[:2] + ''.join(random.choices("0123456789", k=len(word) - 2))
-    elif re.match(email_pattern, word):
-        return fake.email()
-    elif re.match(bic_pattern, word):
-        return ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=len(word)))
-    elif word[0].isupper():
-        return fake.name() + ''.join(c for c in word if not c.isalpha())
-    else:
-        return ''.join(
-            str(random.randint(0, 9)) if c.isdigit()
-            else random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") if c.isalpha()
-            else c
-            for c in word
-        )
-
-def replace_text_in_pdf(pdf_path, replacements, output_path, mask_mode=False):
     try:
-        # Correction : utilisation correcte de Spire.PDF
+        if re.match(iban_pattern, word):
+            return word[:2] + ''.join(random.choices("0123456789", k=len(word) - 2))
+        elif re.match(email_pattern, word):
+            return fake.email()
+        elif re.match(bic_pattern, word):
+            return ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=len(word)))
+        elif word[0].isupper():
+            return fake.name() + ''.join(c for c in word if not c.isalpha())
+        else:
+            return ''.join(
+                str(random.randint(0, 9)) if c.isdigit()
+                else random.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ") if c.isalpha()
+                else c
+                for c in word
+            )
+    except Exception as e:
+        print(f"Erreur génération fake: {e}")
+        return "#" * len(word)
+
+# SOLUTION 1: Spire.PDF corrigé
+def replace_text_in_pdf_spire(pdf_path, replacements, output_path, mask_mode=False):
+    if not SPIRE_AVAILABLE:
+        raise Exception("Spire.PDF n'est pas disponible")
+    
+    try:
         pdf = PdfDocument()
         pdf.LoadFromFile(pdf_path)
         
-        # Itération correcte sur les pages
-        for i in range(pdf.Pages.Count):
-            page = pdf.Pages.get_Item(i)
-            replacer = PdfTextReplacer(page)
-            
-            for original, new in replacements.items():
-                if mask_mode:
-                    # Mode masquage avec des #
-                    text_to_replace = "#" * max(1, len(original) - 2)
-                else:
-                    text_to_replace = new
+        # Correction de l'erreur SpireObject
+        page_count = pdf.Pages.Count
+        print(f"Nombre de pages: {page_count}")
+        
+        for i in range(page_count):
+            try:
+                page = pdf.Pages.get_Item(i)
+                replacer = PdfTextReplacer(page)
                 
-                # Remplacement du texte
-                replacer.ReplaceAllText(original, text_to_replace)
+                for original, new in replacements.items():
+                    text_to_replace = "#" * max(1, len(original) - 2) if mask_mode else new
+                    print(f"Remplacement: '{original}' -> '{text_to_replace}'")
+                    replacer.ReplaceAllText(original, text_to_replace)
+                    
+            except Exception as page_error:
+                print(f"Erreur page {i}: {page_error}")
+                continue
         
         pdf.SaveToFile(output_path)
         pdf.Close()
-        return True
+        print(f"PDF sauvé: {output_path}")
+        
     except Exception as e:
-        print(f"Erreur dans replace_text_in_pdf: {str(e)}")
+        print(f"Erreur Spire.PDF: {e}")
         traceback.print_exc()
-        return False
+        raise e
+
+# SOLUTION 2: PyMuPDF (plus stable)
+def replace_text_in_pdf_pymupdf(pdf_path, replacements, output_path, mask_mode=False):
+    if not PYMUPDF_AVAILABLE:
+        raise Exception("PyMuPDF n'est pas disponible")
+    
+    try:
+        doc = fitz.open(pdf_path)
+        print(f"PDF ouvert, {len(doc)} pages")
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            
+            for original, new in replacements.items():
+                text_to_replace = "#" * max(1, len(original) - 2) if mask_mode else new
+                
+                # Chercher le texte
+                text_instances = page.search_for(original)
+                print(f"Page {page_num}: '{original}' trouvé {len(text_instances)} fois")
+                
+                for inst in text_instances:
+                    # Créer une annotation de rédaction
+                    page.add_redact_annot(inst, text=text_to_replace, fill=(1, 1, 1))
+            
+            # Appliquer les rédactions
+            page.apply_redactions()
+        
+        doc.save(output_path)
+        doc.close()
+        print(f"PDF sauvé avec PyMuPDF: {output_path}")
+        
+    except Exception as e:
+        print(f"Erreur PyMuPDF: {e}")
+        traceback.print_exc()
+        raise e
+
+# Fonction principale qui choisit la meilleure méthode
+def replace_text_in_pdf(pdf_path, replacements, output_path, mask_mode=False):
+    print(f"Remplacement dans PDF: {len(replacements)} éléments")
+    
+    # Essayer PyMuPDF en premier (plus stable)
+    if PYMUPDF_AVAILABLE:
+        try:
+            replace_text_in_pdf_pymupdf(pdf_path, replacements, output_path, mask_mode)
+            return
+        except Exception as e:
+            print(f"PyMuPDF échoué, tentative avec Spire: {e}")
+    
+    # Fallback vers Spire.PDF
+    if SPIRE_AVAILABLE:
+        try:
+            replace_text_in_pdf_spire(pdf_path, replacements, output_path, mask_mode)
+            return
+        except Exception as e:
+            print(f"Spire.PDF échoué: {e}")
+            raise e
+    
+    raise Exception("Aucune bibliothèque PDF disponible")
 
 def detect_entities(text):
+    fake = faker.Faker()
+    
     try:
-        nlp = spacy.load("fr_core_news_sm")  # Changé de fr_core_news_lg à fr_core_news_sm
-        doc = nlp(text)
+        nlp = spacy.load("fr_core_news_lg")
+    except:
+        try:
+            nlp = spacy.load("fr_core_news_sm")
+        except:
+            print("Modèle spaCy français non trouvé")
+            nlp = None
+    
+    name_pattern = r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b"
 
-        name_pattern = r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\b"
-        
-        detected = {
-            "Noms": [],
-            "Emails": re.findall(r"\b[A-Za-z0-9.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text),
-            "Téléphones": re.findall(r"\b(?:\+?\d{1,3}\s?)?(?:\(?\d{1,4}\)?\s?)?\d{1,4}(?:\s?\d{1,4}){1,3}\b", text),
-            "IBANs": re.findall(r"[A-Z]{2}\d{2}\s?(?:\d{4}\s?){4,7}\d{1,4}", text),
-            "BICs": [],
-        }
+    detected = {
+        "Noms": [],
+        "Emails": re.findall(r"\b[A-Za-z0-9.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text),
+        "Téléphones": re.findall(r"\b(?:\+?\d{1,3}\s?)?(?:\(?\d{1,4}\)?\s?)?\d{1,4}(?:\s?\d{1,4}){1,3}\b", text),
+        "IBANs": re.findall(r"[A-Z]{2}\d{2}\s?(?:\d{4}\s?){4,7}\d{1,4}", text),
+        "BICs": [],
+    }
 
-        # Extraction des noms avec spaCy
-        for ent in doc.ents:
-            if ent.label_ == "PER" and ent.text not in detected["Noms"]:
-                detected["Noms"].append(ent.text)
+    # Utiliser spaCy si disponible
+    if nlp:
+        try:
+            doc = nlp(text)
+            for ent in doc.ents:
+                if ent.label_ == "PER" and ent.text not in detected["Noms"]:
+                    detected["Noms"].append(ent.text)
+        except Exception as e:
+            print(f"Erreur spaCy: {e}")
 
-        # Extraction des noms avec regex
-        for name in re.findall(name_pattern, text):
-            if name.lower() not in ["date", "cordialement", "siret", "mail", "mode", "conditions", "nous", "au", "intracom", "code"]:
-                if name not in detected["Noms"]:
-                    detected["Noms"].append(name)
+    # Regex pour les noms
+    for name in re.findall(name_pattern, text):
+        if name.lower() not in ["date", "cordialement", "siret", "mail", "mode", "conditions", "nous", "au", "intracom", "code"]:
+            if name not in detected["Noms"]:
+                detected["Noms"].append(name)
 
-        # Extraire BICs uniquement après le mot "BIC"
-        for segment in text.split("BIC")[1:]:
-            match = re.findall(r"[A-Z]{4}\s?\w{2}\s?\w{2}", segment)
-            if match:
-                detected["BICs"].append(match[0])
+    # Extraire BICs uniquement après le mot "BIC"
+    for segment in text.split("BIC")[1:]:
+        match = re.findall(r"[A-Z]{4}\s?\w{2}\s?\w{2}", segment)
+        if match:
+            detected["BICs"].append(match[0])
 
-        # Nettoyage des téléphones
-        all_phones = detected["Téléphones"][:]
-        detected["Nombres"] = [nb for nb in all_phones if len(nb) < 14 or len(nb) > 17]
-        detected["Téléphones"] = [phone for phone in all_phones if 14 <= len(phone) <= 16]
-        
-        # Nettoyer les noms trop courts
-        detected["Noms"] = [nom for nom in detected["Noms"] if len(nom) > 2]
+    # Nettoyage des téléphones
+    detected["Nombres"] = [
+        nb for nb in detected["Téléphones"] if len(nb) < 14 or len(nb) > 17 and len(nb) > 4
+    ]
+    detected["Téléphones"] = [
+        phone for phone in detected["Téléphones"] if 14 <= len(phone) <= 16
+    ]
 
-        return detected
-    except Exception as e:
-        print(f"Erreur dans detect_entities: {str(e)}")
-        # Retour par défaut en cas d'erreur
-        return {
-            "Noms": [],
-            "Emails": re.findall(r"\b[A-Za-z0-9.%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text),
-            "Téléphones": [],
-            "IBANs": re.findall(r"[A-Z]{2}\d{2}\s?(?:\d{4}\s?){4,7}\d{1,4}", text),
-            "BICs": [],
-        }
+    print(f"Entités détectées: {[(k, len(v)) for k, v in detected.items()]}")
+    return detected
 
 # --- Routes ---
 FILTER_MAP = {
@@ -148,16 +239,16 @@ def anonymize_pdf():
     output_path = None
     
     try:
-        print("=== DÉBUT ANONYMISATION ===")
+        print("=== DÉBUT TRAITEMENT PDF ===")
         
         # Validation du fichier
         if 'file' not in request.files:
             return jsonify({'error': 'Aucun fichier fourni'}), 400
-            
+        
         file = request.files['file']
         if file.filename == '':
             return jsonify({'error': 'Aucun fichier sélectionné'}), 400
-            
+        
         if not allowed_file(file.filename):
             return jsonify({'error': 'Type de fichier invalide, seuls les PDF sont acceptés'}), 400
 
@@ -168,102 +259,104 @@ def anonymize_pdf():
         file.save(input_path)
         
         print(f"Fichier sauvé: {input_path}")
-
-        # Initialisation de Faker
-        fake = faker.Faker('fr_FR')  # Localisation française
+        
+        fake = faker.Faker()
         mode = request.form.get('mode', 'auto')
-        print(f"Mode sélectionné: {mode}")
+        print(f"Mode: {mode}")
 
         if mode == "manual":
-            print("=== MODE MANUEL ===")
+            # Mode manuel
             words = json.loads(request.form.get('words', '[]'))
-            print(f"Mots à anonymiser: {words}")
+            print(f"Mots manuels: {words}")
             
-            replacements = {}
-            for word in words:
-                replacements[word] = generate_fake_value(word, fake)
-            
+            replacements = {word: generate_fake_value(word, fake) for word in words}
             mask_mode = request.form.get('optionManuel') == 'mask'
-            print(f"Mode masquage: {mask_mode}")
-            print(f"Remplacements: {replacements}")
             
-            success = replace_text_in_pdf(input_path, replacements, output_path, mask_mode)
-            if not success:
-                return jsonify({'error': 'Erreur lors du remplacement du texte'}), 500
-                
+            print(f"Replacements: {len(replacements)}, Mask mode: {mask_mode}")
+            replace_text_in_pdf(input_path, replacements, output_path, mask_mode)
         else:
-            print("=== MODE AUTOMATIQUE/FILTRÉ ===")
+            # Mode automatique ou filtré
             filters = json.loads(request.form.get('filters', '["names","phones","emails","iban","bic"]'))
-            print(f"Filtres sélectionnés: {filters}")
+            print(f"Filtres: {filters}")
             
-            # Extraction du texte
             text = extract_text_from_pdf(input_path)
-            print(f"Texte extrait, longueur: {len(text)} caractères")
+            if not text.strip():
+                return jsonify({'error': 'Impossible d\'extraire le texte du PDF'}), 400
             
-            # Détection des entités
+            print(f"Texte extrait: {len(text)} caractères")
             entities = detect_entities(text)
-            print(f"Entités détectées: {entities}")
 
-            # Construction des remplacements
             replacements = {}
             for key, values in entities.items():
-                filter_key = FILTER_MAP.get(key, key.lower())
-                if filter_key not in filters:
-                    print(f"Filtre {filter_key} non sélectionné, ignoré")
+                if FILTER_MAP.get(key, key.lower()) not in filters:
+                    print(f"Filtrage: {key} ignoré")
                     continue
                     
-                print(f"Traitement de {key}: {len(values)} éléments")
                 for value in values:
-                    if key == "Noms":
-                        replacements[value] = fake.name()
-                    elif key == "Téléphones":
-                        replacements[value] = ''.join(str(random.randint(0, 9)) if c.isdigit() else c for c in value)
-                    elif key == "Nombres":
-                        replacements[value] = str(random.randint(1000, 99999))
-                    elif key == "Emails":
-                        replacements[value] = fake.email()
-                    elif key == "IBANs":
-                        replacements[value] = fake.iban()
-                    elif key == "BICs":
-                        replacements[value] = ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=len(value)))
+                    try:
+                        if key == "Noms":
+                            replacements[value] = fake.name()
+                        elif key == "Téléphones":
+                            replacements[value] = ''.join(str(random.randint(0, 9)) if c.isdigit() else c for c in value)
+                        elif key == "Nombres":
+                            replacements[value] = str(random.randint(1000, 99999))
+                        elif key == "Emails":
+                            replacements[value] = fake.email()
+                        elif key == "IBANs":
+                            replacements[value] = fake.iban()
+                        elif key == "BICs":
+                            replacements[value] = ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=len(value)))
+                    except Exception as e:
+                        print(f"Erreur génération pour {value}: {e}")
+                        replacements[value] = "#" * len(value)
 
-            print(f"Remplacements finaux: {replacements}")
-            
-            if not replacements:
-                return jsonify({'error': 'Aucune donnée à anonymiser trouvée avec les filtres sélectionnés'}), 400
-            
-            success = replace_text_in_pdf(input_path, replacements, output_path)
-            if not success:
-                return jsonify({'error': 'Erreur lors du remplacement du texte'}), 500
+            print(f"Total replacements: {len(replacements)}")
+            replace_text_in_pdf(input_path, replacements, output_path)
 
-        # Vérification que le fichier de sortie existe
+        # Vérifier que le fichier de sortie existe
         if not os.path.exists(output_path):
-            return jsonify({'error': 'Le fichier anonymisé n\'a pas pu être créé'}), 500
-            
-        print(f"✅ Anonymisation réussie: {output_path}")
-        return send_file(output_path, as_attachment=True, download_name='anonymized.pdf', mimetype='application/pdf')
+            return jsonify({'error': 'Erreur lors de la génération du fichier anonymisé'}), 500
+        
+        print(f"=== SUCCÈS - Fichier généré: {output_path} ===")
+        
+        return send_file(
+            output_path, 
+            as_attachment=True, 
+            download_name=f'anonymized_{filename}', 
+            mimetype='application/pdf'
+        )
 
-    except json.JSONDecodeError as e:
-        print(f"Erreur JSON: {str(e)}")
-        return jsonify({'error': f'Erreur dans les données JSON: {str(e)}'}), 400
     except Exception as e:
-        print(f"❌ ERREUR GÉNÉRALE: {str(e)}")
+        error_msg = f"Erreur lors du traitement: {str(e)}"
+        print(f"❌ {error_msg}")
         traceback.print_exc()
-        return jsonify({'error': f'Erreur interne: {str(e)}'}), 500
+        return jsonify({'error': error_msg}), 500
 
     finally:
-        # Nettoyage sûr des fichiers temporaires
+        # Nettoyage des fichiers temporaires
         for path in [input_path, output_path]:
             if path and os.path.exists(path):
                 try:
                     os.remove(path)
-                    print(f"Fichier temporaire supprimé: {path}")
+                    print(f"Fichier supprimé: {path}")
                 except Exception as e:
-                    print(f"Impossible de supprimer {path}: {str(e)}")
+                    print(f"Erreur suppression {path}: {e}")
 
-# --- Run ---
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'OK', 
+        'spire_available': SPIRE_AVAILABLE,
+        'pymupdf_available': PYMUPDF_AVAILABLE
+    })
+
 if __name__ == '__main__':
-    print("🚀 Démarrage du serveur PDF Anonymizer")
-    print("📍 URL: http://localhost:5000")
-    print("🔧 Mode debug: Activé")
+    print("=== DÉMARRAGE SERVEUR PDF ANONYMIZER ===")
+    print(f"Spire.PDF disponible: {SPIRE_AVAILABLE}")
+    print(f"PyMuPDF disponible: {PYMUPDF_AVAILABLE}")
+    
+    if not SPIRE_AVAILABLE and not PYMUPDF_AVAILABLE:
+        print("⚠️  ATTENTION: Aucune bibliothèque PDF disponible!")
+        print("Installez PyMuPDF: pip install PyMuPDF")
+    
     app.run(debug=True, host='0.0.0.0', port=5000)
